@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import re
+import uuid
 import requests
 
 
@@ -128,6 +129,9 @@ class RTIClient:
         )
         r.raise_for_status()
 
+        if not s.cookies.get("rti_client_identifier"):
+            s.cookies.set("rti_client_identifier", str(uuid.uuid4()))
+
         return True
 
     @staticmethod
@@ -185,7 +189,7 @@ class RTIClient:
         school_info = student.get("school", {})
 
         import time
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta, timezone, date
 
         now = datetime.now(timezone.utc)
         # Start of the current week (Monday 00:00), end of next week (Sunday 23:59:59)
@@ -226,9 +230,14 @@ class RTIClient:
                 "end": sched.get("scheduleEnd", ""),
                 "status": sched.get("status", "") if selectable else "No schedule",
                 "selectable": selectable,
+                "schedule_id": ssid,
+                "self_enroll_key": sched.get("selfEnrollAccessKey", ""),
                 "exists": True,
                 "sessions": [],
             }
+        # Baseline: use mySessions as the historical record for each day (this
+        # is reliable for past days). For upcoming/selectable days the
+        # authoritative self-enrollment service overrides it below.
         for sess in data.get("mySessions", []) or []:
             ssid = sess.get("sessionScheduleId")
             if ssid in days:
@@ -240,9 +249,12 @@ class RTIClient:
                         "instructor": sess.get("instructor", {}) or {},
                     }
                 )
-
         # Fill in every weekday in the window so that missing days (e.g. a
         # Wednesday with no published schedule) still appear as greyed-out.
+        # The authoritative current enrollment for each day comes from the
+        # self-enrollment service (mySessions can be stale), so we query it here.
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/Denver")).date()
         by_date = {}
         for ssid, d in days.items():
             by_date[d["start"][:10]] = d
@@ -260,13 +272,42 @@ class RTIClient:
                     "week_label": "This Week" if week_index == 0 else ("Next Week" if week_index == 1 else f"Week {week_index + 1}"),
                 }
                 if iso in by_date:
-                    by_date[iso].update(
+                    day_info = by_date[iso]
+                    day_info["past"] = date.fromisoformat(iso) < today
+                    day_info.update(
                         {
                             "week_index": week_index,
                             "week_label": "This Week" if week_index == 0 else ("Next Week" if week_index == 1 else f"Week {week_index + 1}"),
                         }
                     )
-                    day_list.append(by_date[iso])
+                    if day_info["past"]:
+                        day_info["status"] = "Past"
+                        day_info["selectable"] = False
+                    # Pull the real current enrollment from the self-enrollment
+                    # service (mySessions can be out of date / show classes that
+                    # aren't actually available). Tolerate errors: fall back to
+                    # showing no sessions and the day's plain status.
+                    if day_info.get("schedule_id") and day_info.get("selectable"):
+                        try:
+                            info = self._self_enrollment_info(
+                                day_info["schedule_id"], student_id=student_id, school_id=school_id
+                            )
+                            sel = info.get("selectedSession") or {}
+                            if sel.get("sessionId"):
+                                inst = sel.get("instructor") or {}
+                                day_info["sessions"] = [
+                                    {
+                                        "name": sel.get("name", "Untitled"),
+                                        "type": sel.get("sessionType", ""),
+                                        "room": sel.get("room", ""),
+                                        "instructor": inst,
+                                    }
+                                ]
+                            else:
+                                day_info["sessions"] = []
+                        except RTIError:
+                            day_info["sessions"] = []
+                    day_list.append(day_info)
                 else:
                     general["status"] = "No schedule"
                     general["selectable"] = False
@@ -285,3 +326,130 @@ class RTIClient:
             },
             "days": day_list,
         }
+
+    def _student_ref(self):
+        """Returns (student_id, school_id) for the logged-in student entity."""
+        s = self.s
+        r = s.get(
+            "https://www.rtischeduler.com/user/entities",
+            headers={
+                "accept": "application/json, text/plain, */*",
+                "buildid": "8454",
+                "referer": "https://www.rtischeduler.com/ui/choose-login",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "time-zone": "America/Denver",
+                "time-zone-offset-minutes": "360",
+            },
+        )
+        r.raise_for_status()
+        for entity in r.json():
+            if entity.get("role") == "Student" or "Student" in entity.get("roles", []):
+                return entity.get("entity", {}).get("id"), entity.get("school", {}).get("id")
+        raise RTIError("No student entity found for this account")
+
+    def _self_enrollment_info(self, schedule_id, choosing_another=False, student_id=None, school_id=None):
+        """GET the self-enrollment info for a schedule day: the open (choosable)
+        sessions plus the student's current selected session for that day."""
+        if student_id is None or school_id is None:
+            student_id, school_id = self._student_ref()
+        params = {}
+        if choosing_another:
+            params["choosingAnotherSession"] = "true"
+        r = self.s.get(
+            f"https://www.rtischeduler.com/self-enrollment-api/operations/self-enrollment/student/{student_id}/schedule/{schedule_id}/logged-in-self-enrollment",
+            params=params or None,
+            headers=self._api_headers(
+                school_id, student_id, f"https://www.rtischeduler.com/ui/school-timeline/{school_id}"
+            ),
+        )
+        if r.status_code == 401:
+            raise RTIError("Session expired. Log in again.")
+        if r.status_code == 400:
+            raise RTIError(r.json().get("message", "Cannot choose a session for this day."))
+        if r.status_code != 200:
+            raise RTIError(f"Failed to load sessions (HTTP {r.status_code}).")
+        return r.json()
+
+    def list_open_sessions(self, schedule_id, choosing_another=False):
+        """Returns the open (choosable) sessions for a schedule day, plus the
+        current selection if already enrolled. Dict: {sessions, current, current_name}."""
+        data = self._self_enrollment_info(schedule_id, choosing_another)
+        sessions = []
+        for entry in data.get("openSessions", []) or []:
+            sess = entry.get("session", {}) or {}
+            instructor = (entry.get("instructor", {}) or {}).get("lastName", "")
+            sessions.append(
+                {
+                    "id": sess.get("sessionId"),
+                    "name": sess.get("name", "Untitled"),
+                    "room": sess.get("room", ""),
+                    "instructor": instructor,
+                    "capacity": sess.get("capacity"),
+                    "enrolled": sess.get("currentlyEnrolled"),
+                    "type": sess.get("sessionType", ""),
+                }
+            )
+        sel = data.get("selectedSession") or {}
+        instructor = sel.get("instructor") or {}
+        return {
+            "sessions": sessions,
+            "current": sel.get("sessionId"),
+            "current_name": sel.get("name"),
+            "current_room": sel.get("room"),
+            "current_teacher": f"{instructor.get('firstName', '')} {instructor.get('lastName', '')}".strip(),
+        }
+
+    def enroll(self, schedule_id, session_id):
+        """Enrolls the student in a session for a schedule day. Returns the
+        server's message, or raises RTIError on failure.
+        Mirrors the exact request the RTI web app sends (empty body with
+        content-length 0, XSRF double-submit, and the full browser-like
+        headers), which is required for the server to accept the write."""
+        student_id, school_id = self._student_ref()
+        if not self.s.cookies.get("rti_client_identifier"):
+            self.s.cookies.set("rti_client_identifier", str(uuid.uuid4()))
+        referer = (
+            f"https://www.rtischeduler.com/ui/school/{school_id}/schedule/{schedule_id}"
+            f"/self-enrollment/student/{student_id}/confirm/{session_id}"
+        )
+        cookie_str = "; ".join(f"{k}={v}" for k, v in self.s.cookies.get_dict().items())
+        xsrf = self.s.cookies.get("XSRF-TOKEN") or ""
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "buildid": "8527",
+            "cache-control": "no-cache",
+            "content-length": "0",
+            "origin": "https://www.rtischeduler.com",
+            "pragma": "no-cache",
+            "priority": "u=1, i",
+            "referer": referer,
+            "rti-entity-id": str(student_id),
+            "rti-entity-type": "Student",
+            "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Linux"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "time-zone": "America/Denver",
+            "time-zone-offset-minutes": "360",
+            "user-agent": self.HEADERS["User-Agent"],
+            "x-xsrf-token": xsrf,
+            "Cookie": cookie_str,
+        }
+        r = self.s.post(
+            f"https://www.rtischeduler.com/self-enrollment-api/operations/self-enrollment/student/{student_id}/session/{session_id}/logged-in-self-enrollment",
+            headers=headers,
+        )
+        if r.status_code == 200:
+            return r.text.strip() or "Enrolled."
+        if r.status_code in (400, 403):
+            try:
+                msg = r.json().get("message") or r.json().get("error")
+            except Exception:
+                msg = None
+            raise RTIError(msg or f"Enrollment rejected (HTTP {r.status_code}).")
+        raise RTIError(f"Enrollment failed (HTTP {r.status_code}).")

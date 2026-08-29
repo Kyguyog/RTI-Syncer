@@ -42,6 +42,13 @@ BASE_HTML = """
     input { padding:12px 14px; border-radius:8px; border:1px solid var(--border); background:#0f172a; color:#e2e8f0; font-size:1rem; }
     button { padding:12px; border:none; border-radius:8px; background:var(--accent); color:#0f172a; font-weight:700; font-size:1rem; cursor:pointer; }
     button:disabled { opacity:.5; cursor:not-allowed; }
+    .choose-btn { margin-top:12px; padding:9px 14px; font-size:.85rem; font-weight:600; width:100%; }
+    button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+    .pick { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px; }
+    .pick li { border:1px solid var(--border); border-radius:10px; padding:12px 14px; display:flex; gap:12px; align-items:center; background:#0f172a; cursor:pointer; }
+    .pick input { width:auto; }
+    .pick .cap { color:var(--muted); font-size:.78rem; }
+    .pick label { flex:1; cursor:pointer; }
     .error { background:#7f1d1d; border:1px solid #b91c1c; color:#fecaca; padding:12px 16px; border-radius:8px; margin-bottom:16px; }
     .links { margin-top:20px; font-size:.85rem; }
     .links a { color:var(--accent); }
@@ -75,6 +82,8 @@ LOGIN_PAGE = """
 SCHEDULE_PAGE = """
 <h1>My Schedule</h1>
 <p class="sub">{{ student.get('firstName') }} {{ student.get('lastName') }} &middot; {{ school.get('name') }}</p>
+{% if message %}<div class="error" style="background:#14532d;border-color:#166534;color:#86efac;">{{ message }}</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if not days %}
   <div class="card"><div class="empty">No upcoming schedules found.</div></div>
 {% endif %}
@@ -106,10 +115,45 @@ SCHEDULE_PAGE = """
           <span class="room">{% if s.room %}{{ s.room }}{% endif %}</span>
         </div>
       {% endfor %}
+      {% if day.selectable %}
+        <form method="post" action="{{ url_for('choose_session', day_id=day.schedule_id) }}">
+          <input type="hidden" name="name" value="{{ day.name }}">
+          {% if day.sessions %}<input type="hidden" name="changing" value="1">{% endif %}
+          <button type="submit" class="choose-btn">{{ 'Change Session' if day.sessions else 'Choose Session' }}</button>
+        </form>
+      {% endif %}
     </div>
   </div>
 {% endfor %}
 <p class="links"><a href="{{ url_for('logout') }}">Sign out</a></p>
+"""
+
+CHOOSE_PAGE = """
+<h1>{{ day_name }}</h1>
+<p class="sub">Pick the session you want for this day. {% if current_name %}Currently: {{ current_name }}.{% endif %}</p>
+{% if not sessions %}
+  <div class="card"><div class="empty">No open sessions are available to choose for this day.</div></div>
+  <p class="links"><a href="{{ url_for('schedule_page') }}">&larr; Back to schedule</a></p>
+{% else %}
+  <form method="post" action="{{ url_for('enroll', day_id=day_id) }}">
+    <ul class="pick">
+      {% for s in sessions %}
+        <li>
+          <input type="radio" name="session_id" id="s{{ s.id }}" value="{{ s.id }}" {% if s.id == current %}checked{% endif %} required>
+          <label for="s{{ s.id }}">
+            <div>{{ s.name }}</div>
+            <div class="cap">{{ s.room }}{% if s.instructor %} &middot; {{ s.instructor }}{% endif %}</div>
+            <div class="cap">{{ s.enrolled }} / {{ s.capacity }} enrolled</div>
+          </label>
+        </li>
+      {% endfor %}
+    </ul>
+    <div style="display:flex; gap:10px;">
+      <button type="submit" class="ghost">Confirm</button>
+      <a href="{{ url_for('schedule_page') }}" style="flex:1; text-align:center; padding:12px; color:var(--muted); text-decoration:none; border:1px solid var(--border); border-radius:8px;">Cancel</a>
+    </div>
+  </form>
+{% endif %}
 """
 
 
@@ -151,13 +195,14 @@ def index():
     return render_template_string(BASE_HTML, content=render_template_string(LOGIN_PAGE, error=error, email=session.get("email", "")))
 
 
-def render_schedule(schedule):
+def render_schedule(schedule, message=None, error=None):
     days = []
     for d in schedule["days"]:
         days.append({
             "name": d["name"],
             "status": d["status"],
             "selectable": d.get("selectable", True),
+            "schedule_id": d.get("schedule_id"),
             "week_label": d.get("week_label", ""),
             "start_time": fmt_time(d["start"]),
             "end_time": fmt_time(d["end"]),
@@ -176,6 +221,8 @@ def render_schedule(schedule):
         student=schedule["student"],
         school=schedule["school"],
         days=days,
+        message=message,
+        error=error,
     )
     return render_template_string(BASE_HTML, content=page)
 
@@ -184,13 +231,57 @@ def render_schedule(schedule):
 def schedule_page():
     if "email" not in session:
         return index()
+    message = session.pop("_message", None)
+    error = session.pop("_error", None)
     try:
         schedule = load_schedule(session["email"], session["password"])
     except Exception as e:
         session.pop("email", None)
         session.pop("password", None)
         return render_template_string(BASE_HTML, content=render_template_string(LOGIN_PAGE, error=str(e), email=""))
-    return render_schedule(schedule)
+    return render_schedule(schedule, message=message, error=error)
+
+
+@app.route("/choose/<int:day_id>", methods=["POST"])
+def choose_session(day_id):
+    if "email" not in session:
+        return index()
+    client = RTIClient(session["email"], session["password"])
+    try:
+        client.login()
+        info = client.list_open_sessions(day_id, choosing_another=bool(request.form.get("changing")))
+    except RTIError as e:
+        session["_error"] = str(e)
+        return schedule_page()
+    return render_template_string(
+        BASE_HTML,
+        content=render_template_string(
+            CHOOSE_PAGE,
+            day_name=request.form.get("name", ""),
+            day_id=day_id,
+            sessions=info["sessions"],
+            current=info["current"],
+            current_name=info["current_name"],
+        ),
+    )
+
+
+@app.route("/enroll/<int:day_id>", methods=["POST"])
+def enroll(day_id):
+    if "email" not in session:
+        return index()
+    session_id = request.form.get("session_id")
+    if not session_id:
+        session["_error"] = "Please choose a session."
+        return schedule_page()
+    client = RTIClient(session["email"], session["password"])
+    try:
+        client.login()
+        client.enroll(day_id, session_id)
+        session["_message"] = "Done."
+    except RTIError as e:
+        session["_error"] = str(e)
+    return schedule_page()
 
 
 @app.route("/logout")
