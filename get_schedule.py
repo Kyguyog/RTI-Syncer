@@ -1,60 +1,37 @@
 #!/usr/bin/env python3
-import getpass
-import time
+"""CLI wrapper: fetch and print the schedule for a given ClassLink account.
+
+Usage:
+    python3 get_schedule.py EMAIL PASSWORD
+"""
+import argparse
+import json
+import sys
+
 from rti_client import RTIClient, RTIError
 
 
-def fmt_time(iso):
-    if not iso:
-        return ""
-    if len(iso) <= 10:
-        return ""
-    try:
-        return time.strftime("%I:%M %p", time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
-    except Exception:
-        return iso
-
-
 def main():
-    import sys
+    parser = argparse.ArgumentParser(description="Fetch an RTI Scheduler schedule.")
+    parser.add_argument("email")
+    parser.add_argument("password")
+    args = parser.parse_args()
 
-    if len(sys.argv) >= 3:
-        email, password = sys.argv[1], sys.argv[2]
-    else:
-        email = input("Email: ")
-        password = getpass.getpass("Password: ")
-
-    client = RTIClient(email, password)
-    print("[+] Logging in...")
+    client = RTIClient(args.email, args.password)
     try:
         client.login()
+        schedule = client.get_schedule()
     except RTIError as e:
-        print(f"[-] {e}")
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    print("[+] Logged in, fetching schedule...")
 
-    schedule = client.get_schedule()
-    student = schedule["student"]
-    print(f"[+] Student: {student.get('firstName')} {student.get('lastName')} ({schedule['school'].get('name')})")
-
-    print("\n" + "=" * 60)
-    print("MY SCHEDULE (RTI)")
-    print("=" * 60)
-
-    if not schedule["days"]:
-        print("  No upcoming schedules found.")
-
+    print(f"{schedule['student'].get('firstName')} {schedule['student'].get('lastName')} - {schedule['school'].get('name')}")
     for day in schedule["days"]:
-        time_range = fmt_time(day["start"])
-        if day["end"]:
-            time_range += f" - {fmt_time(day['end'])}"
-        print(f"\n  {day['name']}  ({time_range})  [{day['status']}]")
-        if not day["sessions"]:
-            print("    (no sessions for you)")
-        for sess in day["sessions"]:
-            teacher = f"{sess['instructor'].get('firstName', '')} {sess['instructor'].get('lastName', '')}".strip()
-            detail = [p for p in [sess["name"], sess["type"], teacher, sess["room"]] if p]
-            print(f"    - {' | '.join(detail)}")
+        status = "Past" if day.get("past") else (day["status"] or "")
+        sessions = "; ".join(
+            f"{s['name']} ({s['instructor'].get('lastName', '')} / {s['room']})" for s in day["sessions"]
+        )
+        print(f"[{day['week_label']}] {day['name']} ({status}) | {sessions or 'no sessions'}")
 
 
 if __name__ == "__main__":

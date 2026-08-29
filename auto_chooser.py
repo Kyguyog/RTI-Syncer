@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Automatic session chooser.
+"""Automatic session chooser (per-user).
 
-Loads saved credentials + priority rules from a config file, periodically logs
-into RTI Scheduler, and for every upcoming day that has no session chosen yet,
-picks a session based on the priority keyword list and enrolls in it.
+Loads each user's saved credentials + priority rules from a config file,
+periodically logs into RTI Scheduler for every enabled user, and for every
+upcoming day that has no session chosen yet, picks a session based on that
+user's priority keyword list and enrolls in it.
 """
 import json
 import os
@@ -18,37 +19,61 @@ CHECK_INTERVAL_SECONDS = 12 * 60 * 60  # every 12 hours
 BOOTSTRAP_DELAY_SECONDS = 45  # run a first check shortly after start
 
 
-def load_config():
+def _load_store():
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
         except Exception:
             return {}
     return {}
 
 
-def save_config(cfg):
+def _save_store(store):
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(store, f, indent=2)
     os.replace(tmp, CONFIG_PATH)
 
 
+def _key(email):
+    return (email or "").strip().lower()
+
+
+def get_config(email):
+    """Return the config dict for a user, or an empty dict if none."""
+    store = _load_store()
+    return store.get(_key(email), {})
+
+
+def set_config(email, cfg):
+    """Persist a config dict for a user (merges into the store)."""
+    store = _load_store()
+    store[_key(email)] = cfg
+    _save_store(store)
+
+
+def all_users():
+    """Return a dict of email -> config for every stored user."""
+    return _load_store()
+
+
 def _target_text(session, category):
-    """Return the text to match against for a category, or None if unknown."""
+    """Return the text to match against for a category, or empty if unknown."""
     category = (category or "session").lower()
     if category in ("session", "session name", "name"):
         return session.get("name") or ""
     if category in ("teacher", "instructor", "teacher name"):
-        return (session.get("instructor") or "").lower()
+        return session.get("instructor") or ""
     if category in ("room", "room #", "room number"):
         return session.get("room") or ""
     return session.get("name") or ""
 
 
 def rule_matches(rule, session):
-    """True if an open-session dict matches a priority rule."""
+    """True if an open-session dict matches a priority rule (case-insensitive)."""
     if not rule or not rule.get("keyword"):
         return False
     target = _target_text(session, rule.get("category")).lower()
@@ -116,23 +141,19 @@ def run_once(email, password, rules):
 
 def background_loop(stop_event):
     """Run on a background thread. First check shortly after start, then
-    periodically while enabled, using the saved config."""
+    periodically while enabled, handling every enabled stored user."""
     time.sleep(BOOTSTRAP_DELAY_SECONDS)
-    last_run = 0.0
+    last_run = time.time() - CHECK_INTERVAL_SECONDS  # so the first real run is immediate
     while not stop_event.is_set():
-        cfg = load_config()
-        if cfg.get("enabled") and cfg.get("email") and cfg.get("password"):
-            if time.time() - last_run >= CHECK_INTERVAL_SECONDS:
+        if time.time() - last_run >= CHECK_INTERVAL_SECONDS:
+            for email, cfg in (all_users() or {}).items():
+                if not cfg.get("enabled"):
+                    continue
                 try:
-                    run_once(cfg["email"], cfg["password"], cfg.get("rules") or [])
+                    run_once(email, cfg.get("password"), cfg.get("rules") or [])
                 except Exception:
                     pass
-                last_run = time.time()
-                cfg["last_run"] = time.time()
-                try:
-                    save_config(cfg)
-                except Exception:
-                    pass
+            last_run = time.time()
         stop_event.wait(60)
 
 

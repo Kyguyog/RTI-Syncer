@@ -313,9 +313,9 @@ class RTIClient:
                     general["selectable"] = False
                     general["exists"] = False
                     general["sessions"] = []
+                    general["past"] = date.fromisoformat(iso) < today
                     day_list.append(general)
             day += timedelta(days=1)
-
 
         return {
             "student": student.get("entity", {}),

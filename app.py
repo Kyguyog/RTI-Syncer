@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import time
-from flask import Flask, render_template_string, request, session, redirect, url_for
+from flask import Flask, render_template_string, request, session
 from rti_client import RTIClient, RTIError
 import auto_chooser
 
@@ -226,7 +226,6 @@ SETTINGS_PAGE = """
 def fmt_time(iso):
     if not iso:
         return ""
-    # date-only ISO (e.g. placeholder days with no schedule) -> no time
     if len(iso) <= 10:
         return ""
     try:
@@ -250,11 +249,12 @@ def index():
             schedule = load_schedule(email, password)
             session["email"] = email
             session["password"] = password
-            # Persist credentials so the background auto-chooser can log in.
-            cfg = auto_chooser.load_config()
+            # Persist credentials for this user so the background auto-chooser
+            # can log in on their behalf.
+            cfg = auto_chooser.get_config(email)
             cfg["email"] = email
             cfg["password"] = password
-            auto_chooser.save_config(cfg)
+            auto_chooser.set_config(email, cfg)
         except (RTIError, Exception) as e:
             return render_template_string(
                 BASE_HTML,
@@ -373,8 +373,8 @@ def _cat_options_json():
     return json.dumps(CATEGORIES)
 
 
-def render_settings(message=None, error=None, rule_errors=None):
-    cfg = auto_chooser.load_config()
+def render_settings(email, message=None, error=None, rule_errors=None):
+    cfg = auto_chooser.get_config(email)
     rules = cfg.get("rules") or []
     return render_template_string(
         BASE_HTML,
@@ -396,14 +396,15 @@ def render_settings(message=None, error=None, rule_errors=None):
 def settings_page():
     if "email" not in session:
         return index()
-    return render_settings()
+    return render_settings(session["email"])
 
 
 @app.route("/settings", methods=["POST"])
 def save_settings():
     if "email" not in session:
         return index()
-    cfg = auto_chooser.load_config()
+    email = session["email"]
+    cfg = auto_chooser.get_config(email)
     cfg["enabled"] = "enabled" in request.form
 
     categories = request.form.getlist("category[]")
@@ -420,22 +421,22 @@ def save_settings():
         rules.append({"category": cat, "keyword": kw})
     if not rule_errors:
         cfg["rules"] = rules
-        auto_chooser.save_config(cfg)
-        return render_settings(message="Settings saved.")
-    cfg["rules"] = cfg.get("rules") or []
-    return render_settings(rule_errors=rule_errors)
+        auto_chooser.set_config(email, cfg)
+        return render_settings(email, message="Settings saved.")
+    return render_settings(email, rule_errors=rule_errors)
 
 
 @app.route("/run-now", methods=["POST"])
 def run_now():
     if "email" not in session:
         return index()
-    cfg = auto_chooser.load_config()
+    email = session["email"]
+    cfg = auto_chooser.get_config(email)
     if not (cfg.get("email") and cfg.get("password")):
-        return render_settings(error="No saved credentials. Sign in first.")
-    report = auto_chooser.run_once(cfg["email"], cfg["password"], cfg.get("rules") or [])
+        return render_settings(email, error="No saved credentials. Sign in first.")
+    report = auto_chooser.run_once(email, cfg.get("password"), cfg.get("rules") or [])
     cfg["last_run"] = time.time()
-    auto_chooser.save_config(cfg)
+    auto_chooser.set_config(email, cfg)
     lines = []
     if report["enrolled"]:
         lines.append("<b>Chosen/enrolled:</b><ul>" + "".join(f"<li>{x}</li>" for x in report["enrolled"]) + "</ul>")
