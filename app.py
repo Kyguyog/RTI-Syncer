@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import time
-from flask import Flask, render_template_string, request, session
+from flask import Flask, render_template_string, request, session, redirect, url_for
 from rti_client import RTIClient, RTIError
+import auto_chooser
 
 app = Flask(__name__)
 app.secret_key = "change-me-rti-sync"
@@ -49,6 +50,10 @@ BASE_HTML = """
     .pick input { width:auto; }
     .pick .cap { color:var(--muted); font-size:.78rem; }
     .pick label { flex:1; cursor:pointer; }
+    .rule { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+    .rule select { padding:10px; border-radius:8px; border:1px solid var(--border); background:#0f172a; color:#e2e8f0; font-size:.9rem; flex:1; }
+    .rule input { flex:1.4; padding:10px; }
+    .rule button { padding:10px; width:auto; }
     .error { background:#7f1d1d; border:1px solid #b91c1c; color:#fecaca; padding:12px 16px; border-radius:8px; margin-bottom:16px; }
     .links { margin-top:20px; font-size:.85rem; }
     .links a { color:var(--accent); }
@@ -125,7 +130,7 @@ SCHEDULE_PAGE = """
     </div>
   </div>
 {% endfor %}
-<p class="links"><a href="{{ url_for('logout') }}">Sign out</a></p>
+<p class="links"><a href="{{ url_for('settings_page') }}">Auto-Session Chooser</a> &middot; <a href="{{ url_for('logout') }}">Sign out</a></p>
 """
 
 CHOOSE_PAGE = """
@@ -156,6 +161,67 @@ CHOOSE_PAGE = """
 {% endif %}
 """
 
+SETTINGS_PAGE = """
+<h1>Auto-Session Chooser</h1>
+<p class="sub">Automatically picks your session for any upcoming day you haven't set yet, using a priority keyword list. Runs every 12 hours when enabled.</p>
+{% if message %}<div class="error" style="background:#14532d;border-color:#166534;color:#86efac;">{{ message }}</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url_for('save_settings') }}">
+  <div style="display:flex; align-items:center; gap:10px; margin-bottom:18px;">
+    <label for="enabled" style="flex:1;">Enabled</label>
+    <input type="checkbox" id="enabled" name="enabled" {% if enabled %}checked{% endif %} style="width:auto;">
+  </div>
+
+  <div class="week-heading">Priority List (first match wins)</div>
+  {% if rule_errors %}<div class="error">{{ rule_errors }}</div>{% endif %}
+  <div id="rules">
+    {% for r in rules %}
+      <div class="rule">
+        <select name="category[]">
+          {% for c in categories %}
+            <option value="{{ c[0] }}" {% if r.category == c[0] %}selected{% endif %}>{{ c[1] }}</option>
+          {% endfor %}
+        </select>
+        <input type="text" name="keyword[]" value="{{ r.keyword }}" placeholder="keyword">
+        <button type="button" class="ghost remove-rule" style="width:auto;">Remove</button>
+      </div>
+    {% endfor %}
+  </div>
+  <button type="button" class="ghost add-rule" style="width:auto; margin-bottom:16px;">+ Add another keyword</button>
+
+  <button type="submit">Save settings</button>
+</form>
+
+<div style="margin-top:14px; display:flex; gap:10px;">
+  <form method="post" action="{{ url_for('run_now') }}">
+    <button type="submit" class="ghost" style="width:auto;">Run check now</button>
+  </form>
+  <a href="{{ url_for('schedule_page') }}" style="flex:1; padding:12px; color:var(--muted); text-decoration:none; border:1px solid var(--border); border-radius:8px; text-align:center;">Back to schedule</a>
+</div>
+
+{% if last_run %}
+<p class="sub" style="margin-top:18px;">Last auto-run: {{ last_run }}</p>
+{% endif %}
+<script>
+  var catOptions = {{ cat_options | safe }};
+  function ruleRow(category, keyword) {
+    var div = document.createElement('div');
+    div.className = 'rule';
+    var sel = '<select name="category[]">';
+    catOptions.forEach(function(c){ sel += '<option value="'+c[0]+'"'+(c[0]===category?' selected':'')+'>'+c[1]+'</option>'; });
+    sel += '</select>';
+    div.innerHTML = sel + '<input type="text" name="keyword[]" value="'+ (keyword||'') +'" placeholder="keyword"><button type="button" class="ghost remove-rule" style="width:auto;">Remove</button>';
+    return div;
+  }
+  document.querySelector('.add-rule').addEventListener('click', function(){
+    document.getElementById('rules').appendChild(ruleRow('session',''));
+  });
+  document.getElementById('rules').addEventListener('click', function(e){
+    if (e.target.classList.contains('remove-rule')) { e.target.closest('.rule').remove(); }
+  });
+</script>
+"""
+
 
 def fmt_time(iso):
     if not iso:
@@ -184,6 +250,11 @@ def index():
             schedule = load_schedule(email, password)
             session["email"] = email
             session["password"] = password
+            # Persist credentials so the background auto-chooser can log in.
+            cfg = auto_chooser.load_config()
+            cfg["email"] = email
+            cfg["password"] = password
+            auto_chooser.save_config(cfg)
         except (RTIError, Exception) as e:
             return render_template_string(
                 BASE_HTML,
@@ -290,5 +361,104 @@ def logout():
     return index()
 
 
+CATEGORIES = [
+    ("session", "Session name"),
+    ("teacher", "Teacher name"),
+    ("room", "Room #/name"),
+]
+
+
+def _cat_options_json():
+    import json
+    return json.dumps(CATEGORIES)
+
+
+def render_settings(message=None, error=None, rule_errors=None):
+    cfg = auto_chooser.load_config()
+    rules = cfg.get("rules") or []
+    return render_template_string(
+        BASE_HTML,
+        content=render_template_string(
+            SETTINGS_PAGE,
+            enabled=bool(cfg.get("enabled")),
+            rules=rules,
+            categories=CATEGORIES,
+            cat_options=_cat_options_json(),
+            message=message,
+            error=error,
+            rule_errors=rule_errors,
+            last_run=cfg.get("last_run"),
+        ),
+    )
+
+
+@app.route("/settings")
+def settings_page():
+    if "email" not in session:
+        return index()
+    return render_settings()
+
+
+@app.route("/settings", methods=["POST"])
+def save_settings():
+    if "email" not in session:
+        return index()
+    cfg = auto_chooser.load_config()
+    cfg["enabled"] = "enabled" in request.form
+
+    categories = request.form.getlist("category[]")
+    keywords = request.form.getlist("keyword[]")
+    rules = []
+    rule_errors = None
+    for cat, kw in zip(categories, keywords):
+        kw = kw.strip()
+        if not kw:
+            continue
+        if cat not in [c[0] for c in CATEGORIES]:
+            rule_errors = "One of the categories is invalid."
+            break
+        rules.append({"category": cat, "keyword": kw})
+    if not rule_errors:
+        cfg["rules"] = rules
+        auto_chooser.save_config(cfg)
+        return render_settings(message="Settings saved.")
+    cfg["rules"] = cfg.get("rules") or []
+    return render_settings(rule_errors=rule_errors)
+
+
+@app.route("/run-now", methods=["POST"])
+def run_now():
+    if "email" not in session:
+        return index()
+    cfg = auto_chooser.load_config()
+    if not (cfg.get("email") and cfg.get("password")):
+        return render_settings(error="No saved credentials. Sign in first.")
+    report = auto_chooser.run_once(cfg["email"], cfg["password"], cfg.get("rules") or [])
+    cfg["last_run"] = time.time()
+    auto_chooser.save_config(cfg)
+    lines = []
+    if report["enrolled"]:
+        lines.append("<b>Chosen/enrolled:</b><ul>" + "".join(f"<li>{x}</li>" for x in report["enrolled"]) + "</ul>")
+    if report["errors"]:
+        lines.append("<b>Errors:</b><ul>" + "".join(f"<li>{x}</li>" for x in report["errors"]) + "</ul>")
+    body = "".join(lines) or "<p>No changes needed.</p>"
+    return render_template_string(
+        BASE_HTML,
+        content=render_template_string(
+            SETTINGS_PAGE + "{{ report | safe }}",
+            enabled=bool(cfg.get("enabled")),
+            rules=cfg.get("rules") or [],
+            categories=CATEGORIES,
+            cat_options=_cat_options_json(),
+            message=None,
+            error=None,
+            rule_errors=None,
+            last_run=cfg.get("last_run"),
+            report=body,
+        ),
+    )
+
+
 if __name__ == "__main__":
+    auto_chooser.start_scheduler()
     app.run(host="127.0.0.1", port=5000, debug=False)
