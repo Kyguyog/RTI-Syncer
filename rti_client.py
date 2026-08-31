@@ -222,14 +222,40 @@ class RTIClient:
         for sched in data.get("schedules", []) or []:
             ssid = sched.get("sessionScheduleId")
             # Whether the student can pick a class on this day
-            # (e.g. Wednesdays have studentEnrollment=None -> not selectable)
-            selectable = bool(sched.get("studentEnrollment"))
+            # (e.g. Wednesdays have studentEnrollment=None -> not selectable).
+            # A day may be published but self-enrollment may not be open yet:
+            # studentEnrollment is set but studentEnrollmentStart is in the
+            # future, so the student can't choose until that moment.
+            enrolled_configured = bool(sched.get("studentEnrollment"))
+            enrollment_open = False
+            if enrolled_configured:
+                start_str = sched.get("studentEnrollmentStart", "")
+                if start_str:
+                    try:
+                        start_dt = datetime.fromisoformat(
+                            start_str.replace("Z", "+00:00")
+                        )
+                        if start_dt.tzinfo is None:
+                            start_dt = start_dt.replace(tzinfo=timezone.utc)
+                        enrollment_open = now >= start_dt
+                    except Exception:
+                        enrollment_open = True
+                else:
+                    enrollment_open = True
+            selectable = enrolled_configured and enrollment_open
+            if not enrolled_configured:
+                status = "No Jurassic"
+            elif not enrollment_open:
+                status = "Enrollment not open"
+            else:
+                status = sched.get("status", "Ready")
             days[ssid] = {
                 "name": sched.get("name", "Untitled"),
                 "start": sched.get("scheduleStart", ""),
                 "end": sched.get("scheduleEnd", ""),
-                "status": sched.get("status", "") if selectable else "No schedule",
+                "status": status,
                 "selectable": selectable,
+                "enrolled_configured": enrolled_configured,
                 "schedule_id": ssid,
                 "self_enroll_key": sched.get("selfEnrollAccessKey", ""),
                 "exists": True,
@@ -309,7 +335,7 @@ class RTIClient:
                             day_info["sessions"] = []
                     day_list.append(day_info)
                 else:
-                    general["status"] = "No schedule"
+                    general["status"] = "No Jurassic"
                     general["selectable"] = False
                     general["exists"] = False
                     general["sessions"] = []
