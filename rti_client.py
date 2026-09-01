@@ -300,6 +300,7 @@ class RTIClient:
                 if iso in by_date:
                     day_info = by_date[iso]
                     day_info["past"] = date.fromisoformat(iso) < today
+                    day_info["today"] = date.fromisoformat(iso) == today
                     day_info.update(
                         {
                             "week_index": week_index,
@@ -340,6 +341,7 @@ class RTIClient:
                     general["exists"] = False
                     general["sessions"] = []
                     general["past"] = date.fromisoformat(iso) < today
+                    general["today"] = date.fromisoformat(iso) == today
                     day_list.append(general)
             day += timedelta(days=1)
 

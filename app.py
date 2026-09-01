@@ -37,6 +37,7 @@ BASE_HTML = """
     .sess .room { margin-left:auto; font-weight:600; color:var(--accent); }
     .empty { color:var(--muted); font-style:italic; }
     .card.disabled { opacity:.45; }
+    .card.today { border-color:#166534; background:#0f3317; box-shadow:0 0 0 1px #166534 inset; }
     .card.disabled .day-header, .card.disabled .day-sub, .card.disabled .sess { filter:grayscale(1); }
     form { display:flex; flex-direction:column; gap:14px; }
     label { font-size:.85rem; color:var(--muted); }
@@ -102,7 +103,7 @@ SCHEDULE_PAGE = """
     {% set ns.current = day.week_label %}
     <div class="week-heading">{{ day.week_label }}</div>
   {% endif %}
-  <div class="card{% if not day.selectable %} disabled{% endif %}">
+  <div class="card{% if not day.selectable %} disabled{% endif %}{% if day.today %} today{% endif %}">
     <div class="day-header">
       <span>{{ day.name }}</span>
       {% if not day.selectable %}
@@ -277,6 +278,7 @@ def render_schedule(schedule, message=None, error=None):
             "name": d["name"],
             "status": d["status"],
             "selectable": d.get("selectable", True),
+            "today": d.get("today", False),
             "schedule_id": d.get("schedule_id"),
             "week_label": d.get("week_label", ""),
             "start_time": fmt_time(d["start"]),
