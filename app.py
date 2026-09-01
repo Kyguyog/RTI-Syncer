@@ -57,6 +57,10 @@ BASE_HTML = """
     .error { background:#7f1d1d; border:1px solid #b91c1c; color:#fecaca; padding:12px 16px; border-radius:8px; margin-bottom:16px; }
     .links { margin-top:20px; font-size:.85rem; }
     .links a { color:var(--accent); }
+    @media (max-width:600px) {
+      .day-header { flex-direction:column; gap:6px; }
+      .badge { align-self:flex-start; }
+    }
   </style>
 </head>
 <body>
