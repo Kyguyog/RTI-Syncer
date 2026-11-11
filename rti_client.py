@@ -13,6 +13,9 @@ class RTIClient:
     """Authenticates with RTI Scheduler via ClassLink and fetches a student's schedule."""
 
     DISTRICT = "alpinesd"
+    # Used only if RTI's public UI shell cannot be read.  RTI rejects writes
+    # carrying an old BuildID, so login refreshes this from /ui/.
+    DEFAULT_BUILD_ID = "9055"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
         "accept-language": "en-US,en;q=0.9",
@@ -23,8 +26,61 @@ class RTIClient:
     def __init__(self, email, password):
         self.email = email
         self.password = password
+        self.build_id = self.DEFAULT_BUILD_ID
         self.s = requests.Session()
         self.s.headers.update(self.HEADERS)
+
+    def _capture_build_id(self, response):
+        """Update BuildID from RTI's UI shell when it advertises a new build."""
+        if not response:
+            return
+        header_build_id = response.headers.get("BuildID")
+        if header_build_id:
+            self.build_id = str(header_build_id)
+            return
+        # The current UI publishes its build as assets/initialize.js?cb=9055.
+        # Keep a second pattern for older/newer shells that expose buildId in
+        # bootstrap JSON instead.
+        text = response.text or ""
+        match = re.search(r"initialize\.js\?cb=(\d+)", text, re.IGNORECASE)
+        if not match:
+            match = re.search(
+                r'["\']buildId["\']\s*:\s*["\']([^"\']+)',
+                text,
+                re.IGNORECASE,
+            )
+        if match:
+            self.build_id = match.group(1)
+
+    def _refresh_build_id(self):
+        """Best-effort refresh of the frontend/API compatibility identifier."""
+        try:
+            response = self.s.get(
+                "https://www.rtischeduler.com/ui/",
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "referer": "https://www.rtischeduler.com/",
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "same-origin",
+                    "upgrade-insecure-requests": "1",
+                },
+            )
+            if response.status_code == 200:
+                self._capture_build_id(response)
+        except requests.RequestException:
+            # Authentication can still work with the fallback build ID, and a
+            # useful API error is preferable to failing login on this probe.
+            pass
+
+    @staticmethod
+    def _timezone_offset_minutes():
+        """Return JavaScript-style offset minutes for the configured timezone."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        utc_offset = datetime.now(ZoneInfo("America/Denver")).utcoffset()
+        return -int(utc_offset.total_seconds() // 60) if utc_offset else 0
 
     def login(self):
         s = self.s
@@ -129,6 +185,26 @@ class RTIClient:
         )
         r.raise_for_status()
 
+        self._capture_build_id(r)
+        self._refresh_build_id()
+
+        # The current frontend gets its environment-specific CSRF cookie while
+        # bootstrapping the logged-in user.  ClassLink also leaves behind a
+        # generic XSRF-TOKEN cookie, but that token is not valid for RTI's
+        # self-enrollment API.
+        r = s.get(
+            "https://www.rtischeduler.com/user/principal",
+            headers={
+                "accept": "application/json, text/plain, */*",
+                "buildid": self.build_id,
+                "referer": "https://www.rtischeduler.com/ui/choose-login",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            },
+        )
+        r.raise_for_status()
+
         if not s.cookies.get("rti_client_identifier"):
             s.cookies.set("rti_client_identifier", str(uuid.uuid4()))
 
@@ -145,7 +221,7 @@ class RTIClient:
     def _api_headers(self, school_id, student_id, referer):
         return {
             "accept": "application/json, text/plain, */*",
-            "buildid": "8454",
+            "buildid": self.build_id,
             "referer": referer,
             "rti-entity-id": str(student_id),
             "rti-entity-type": "Student",
@@ -153,7 +229,7 @@ class RTIClient:
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
             "time-zone": "America/Denver",
-            "time-zone-offset-minutes": "360",
+            "time-zone-offset-minutes": str(self._timezone_offset_minutes()),
         }
 
     def get_schedule(self):
@@ -164,13 +240,13 @@ class RTIClient:
             "https://www.rtischeduler.com/user/entities",
             headers={
                 "accept": "application/json, text/plain, */*",
-                "buildid": "8454",
+                "buildid": self.build_id,
                 "referer": "https://www.rtischeduler.com/ui/choose-login",
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
                 "time-zone": "America/Denver",
-                "time-zone-offset-minutes": "360",
+                "time-zone-offset-minutes": str(self._timezone_offset_minutes()),
             },
         )
         r.raise_for_status()
@@ -362,13 +438,13 @@ class RTIClient:
             "https://www.rtischeduler.com/user/entities",
             headers={
                 "accept": "application/json, text/plain, */*",
-                "buildid": "8454",
+                "buildid": self.build_id,
                 "referer": "https://www.rtischeduler.com/ui/choose-login",
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
                 "time-zone": "America/Denver",
-                "time-zone-offset-minutes": "360",
+                "time-zone-offset-minutes": str(self._timezone_offset_minutes()),
             },
         )
         r.raise_for_status()
@@ -442,12 +518,15 @@ class RTIClient:
             f"https://www.rtischeduler.com/ui/school/{school_id}/schedule/{schedule_id}"
             f"/self-enrollment/student/{student_id}/confirm/{session_id}"
         )
-        cookie_str = "; ".join(f"{k}={v}" for k, v in self.s.cookies.get_dict().items())
-        xsrf = self.s.cookies.get("XSRF-TOKEN") or ""
+        xsrf = (
+            self.s.cookies.get("XSRF-TOKEN-PROD")
+            or self.s.cookies.get("XSRF-TOKEN")
+            or ""
+        )
         headers = {
             "accept": "application/json, text/plain, */*",
             "accept-language": "en-US,en;q=0.9",
-            "buildid": "8527",
+            "buildid": self.build_id,
             "cache-control": "no-cache",
             "content-length": "0",
             "origin": "https://www.rtischeduler.com",
@@ -463,10 +542,9 @@ class RTIClient:
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
             "time-zone": "America/Denver",
-            "time-zone-offset-minutes": "360",
+            "time-zone-offset-minutes": str(self._timezone_offset_minutes()),
             "user-agent": self.HEADERS["User-Agent"],
             "x-xsrf-token": xsrf,
-            "Cookie": cookie_str,
         }
         r = self.s.post(
             f"https://www.rtischeduler.com/self-enrollment-api/operations/self-enrollment/student/{student_id}/session/{session_id}/logged-in-self-enrollment",
