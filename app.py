@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+from datetime import datetime
 from flask import Flask, render_template_string, request, session
 from rti_client import RTIClient, RTIError
 import auto_chooser
@@ -52,6 +53,8 @@ BASE_HTML = """
     .pick .cap { color:var(--muted); font-size:.78rem; }
     .pick label { flex:1; cursor:pointer; }
     .rule { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+    .rule-order { display:flex; gap:4px; }
+    .rule-order button { padding:10px 12px; min-width:42px; width:auto; }
     .rule select { padding:10px; border-radius:8px; border:1px solid var(--border); background:#0f172a; color:#e2e8f0; font-size:.9rem; flex:1; }
     .rule input { flex:1.4; padding:10px; }
     .rule button { padding:10px; width:auto; }
@@ -61,6 +64,10 @@ BASE_HTML = """
     @media (max-width:600px) {
       .day-header { flex-direction:column; gap:6px; }
       .badge { align-self:flex-start; }
+      .rule { flex-wrap:wrap; }
+      .rule select, .rule input { min-width:calc(50% - 4px); }
+      .rule-order { order:3; }
+      .rule .remove-rule { order:4; margin-left:auto; }
     }
   </style>
 </head>
@@ -168,7 +175,7 @@ CHOOSE_PAGE = """
 
 SETTINGS_PAGE = """
 <h1>Auto-Session Chooser</h1>
-<p class="sub">Automatically picks your session for any upcoming day you haven't set yet, using a priority keyword list. Runs every 12 hours when enabled.</p>
+<p class="sub">Automatically picks your session for any upcoming day you haven't set yet, using a priority keyword list. Runs daily at midnight and noon when enabled.</p>
 {% if message %}<div class="error" style="background:#14532d;border-color:#166534;color:#86efac;">{{ message }}</div>{% endif %}
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 <form method="post" action="{{ url_for('save_settings') }}">
@@ -188,6 +195,10 @@ SETTINGS_PAGE = """
           {% endfor %}
         </select>
         <input type="text" name="keyword[]" value="{{ r.keyword }}" placeholder="keyword">
+        <div class="rule-order">
+          <button type="button" class="ghost move-up" aria-label="Move rule up" title="Move up">&uarr;</button>
+          <button type="button" class="ghost move-down" aria-label="Move rule down" title="Move down">&darr;</button>
+        </div>
         <button type="button" class="ghost remove-rule" style="width:auto;">Remove</button>
       </div>
     {% endfor %}
@@ -205,7 +216,7 @@ SETTINGS_PAGE = """
 </div>
 
 {% if last_run %}
-<p class="sub" style="margin-top:18px;">Last auto-run: {{ last_run }}</p>
+<p class="sub" style="margin-top:18px;">Last run: {{ last_run }}</p>
 {% endif %}
 <script>
   var catOptions = {{ cat_options | safe }};
@@ -215,15 +226,33 @@ SETTINGS_PAGE = """
     var sel = '<select name="category[]">';
     catOptions.forEach(function(c){ sel += '<option value="'+c[0]+'"'+(c[0]===category?' selected':'')+'>'+c[1]+'</option>'; });
     sel += '</select>';
-    div.innerHTML = sel + '<input type="text" name="keyword[]" value="'+ (keyword||'') +'" placeholder="keyword"><button type="button" class="ghost remove-rule" style="width:auto;">Remove</button>';
+    div.innerHTML = sel + '<input type="text" name="keyword[]" value="'+ (keyword||'') +'" placeholder="keyword"><div class="rule-order"><button type="button" class="ghost move-up" aria-label="Move rule up" title="Move up">&uarr;</button><button type="button" class="ghost move-down" aria-label="Move rule down" title="Move down">&darr;</button></div><button type="button" class="ghost remove-rule" style="width:auto;">Remove</button>';
     return div;
+  }
+  function updateMoveButtons() {
+    var rows = Array.from(document.querySelectorAll('#rules .rule'));
+    rows.forEach(function(row, index) {
+      row.querySelector('.move-up').disabled = index === 0;
+      row.querySelector('.move-down').disabled = index === rows.length - 1;
+    });
   }
   document.querySelector('.add-rule').addEventListener('click', function(){
     document.getElementById('rules').appendChild(ruleRow('session',''));
+    updateMoveButtons();
   });
   document.getElementById('rules').addEventListener('click', function(e){
-    if (e.target.classList.contains('remove-rule')) { e.target.closest('.rule').remove(); }
+    var row = e.target.closest('.rule');
+    if (!row) { return; }
+    if (e.target.classList.contains('remove-rule')) {
+      row.remove();
+    } else if (e.target.classList.contains('move-up') && row.previousElementSibling) {
+      row.parentNode.insertBefore(row, row.previousElementSibling);
+    } else if (e.target.classList.contains('move-down') && row.nextElementSibling) {
+      row.parentNode.insertBefore(row.nextElementSibling, row);
+    }
+    updateMoveButtons();
   });
+  updateMoveButtons();
 </script>
 """
 
@@ -237,6 +266,18 @@ def fmt_time(iso):
         return time.strftime("%I:%M %p", time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
     except Exception:
         return iso
+
+
+def fmt_timestamp(value):
+    """Format a stored Unix timestamp in the server's local time."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(float(value))
+        clock = dt.strftime("%I:%M %p").lstrip("0")
+        return f"{dt.strftime('%b')} {dt.day}, {dt.year} at {clock}"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(value)
 
 
 def load_schedule(email, password):
@@ -393,7 +434,7 @@ def render_settings(email, message=None, error=None, rule_errors=None):
             message=message,
             error=error,
             rule_errors=rule_errors,
-            last_run=cfg.get("last_run"),
+            last_run=fmt_timestamp(cfg.get("last_run")),
         ),
     )
 
@@ -460,7 +501,7 @@ def run_now():
             message=None,
             error=None,
             rule_errors=None,
-            last_run=cfg.get("last_run"),
+            last_run=fmt_timestamp(cfg.get("last_run")),
             report=body,
         ),
     )

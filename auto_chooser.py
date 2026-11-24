@@ -10,14 +10,11 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timedelta
 
 from rti_client import RTIClient, RTIError
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rti_config.json")
-
-CHECK_INTERVAL_SECONDS = 12 * 60 * 60  # every 12 hours
-BOOTSTRAP_DELAY_SECONDS = 45  # run a first check shortly after start
-
 
 def _load_store():
     if os.path.exists(CONFIG_PATH):
@@ -139,22 +136,36 @@ def run_once(email, password, rules):
     return report
 
 
+def next_scheduled_run(now=None):
+    """Return the next local noon or midnight after *now*."""
+    now = now or datetime.now()
+    if now.hour < 12:
+        return now.replace(hour=12, minute=0, second=0, microsecond=0)
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _seconds_until_next_run(now=None):
+    now = now or datetime.now()
+    return max(0, next_scheduled_run(now).timestamp() - now.timestamp())
+
+
 def background_loop(stop_event):
-    """Run on a background thread. First check shortly after start, then
-    periodically while enabled, handling every enabled stored user."""
-    time.sleep(BOOTSTRAP_DELAY_SECONDS)
-    last_run = time.time() - CHECK_INTERVAL_SECONDS  # so the first real run is immediate
+    """Run enabled users at local midnight and noon each day."""
     while not stop_event.is_set():
-        if time.time() - last_run >= CHECK_INTERVAL_SECONDS:
-            for email, cfg in (all_users() or {}).items():
-                if not cfg.get("enabled"):
-                    continue
-                try:
-                    run_once(email, cfg.get("password"), cfg.get("rules") or [])
-                except Exception:
-                    pass
-            last_run = time.time()
-        stop_event.wait(60)
+        if stop_event.wait(_seconds_until_next_run()):
+            break
+        for email, cfg in (all_users() or {}).items():
+            if not cfg.get("enabled"):
+                continue
+            try:
+                run_once(email, cfg.get("password"), cfg.get("rules") or [])
+                # Read the latest config again so a settings change made
+                # during the check is not overwritten by this older copy.
+                latest_cfg = get_config(email)
+                latest_cfg["last_run"] = time.time()
+                set_config(email, latest_cfg)
+            except Exception:
+                pass
 
 
 _scheduler_thread = None
